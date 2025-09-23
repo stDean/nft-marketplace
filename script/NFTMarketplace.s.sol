@@ -8,10 +8,11 @@ import {HelperConfig} from "script/HelperConfig.s.sol";
 contract DeployNFTMarketplace is Script {
     function run() external returns (NFTMarketplace, HelperConfig) {
         HelperConfig helperConfig = new HelperConfig();
+        HelperConfig.NetworkConfig memory config = helperConfig.getConfig();
 
         vm.startBroadcast();
 
-        NFTMarketplace nftMarketplace = new NFTMarketplace();
+        NFTMarketplace nftMarketplace = new NFTMarketplace(config.protocolFee, config.treasury);
 
         vm.stopBroadcast();
 
