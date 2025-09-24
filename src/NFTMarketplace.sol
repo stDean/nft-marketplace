@@ -81,6 +81,15 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         uint256 price,
         uint256 expiry
     );
+    event ItemSold(
+        address indexed buyer,
+        address indexed seller,
+        address indexed nftContract,
+        uint256 tokenId,
+        address paymentToken,
+        uint256 price,
+        uint256 protocolFee
+    );
 
     // ================= ERRORS ======================
     error NFTMarketplace__FeeTooHigh();
@@ -92,14 +101,22 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__UnsupportedPaymentToken();
     error NFTMarketplace__InvalidExpiry();
     error NFTMarketplace__NotListingOwner();
+    error NFTMarketplace__ItemNotForSale();
+    error NFTMarketplace__ListingExpired();
+    error NFTMarketplace__RoyaltyExceedPrice();
+    error NFTMarketplace__TransferFailed();
 
     // ================= FUNCTIONS ======================
+    // Required to receive native tokens
+    receive() external payable {}
+
     /**
      * @notice Initializes the NFT marketplace contract
      * @param _protocolFee The fee percentage in basis points (100 = 1%)
      * @param _treasury The address that receives protocol fees
      * @dev Sets up initial configuration and adds native ETH as supported payment token
      */
+
     constructor(uint256 _protocolFee, address _treasury) Ownable(msg.sender) {
         if (_protocolFee > 1000) revert NFTMarketplace__FeeTooHigh(); // Max 10% fee
         if (_treasury == address(0)) revert NFTMarketplace__InvalidTreasury();
@@ -198,6 +215,141 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         s_listings[nftContract][tokenId] =
             Listing({seller: msg.sender, paymentToken: paymentToken, price: price, expiry: expiry, active: true});
         emit ItemListed(msg.sender, nftContract, tokenId, paymentToken, price, expiry);
+    }
+
+    /**
+     * @notice Purchase an NFT listed for sale
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token to purchase
+     * @dev Payment must be sent with the transaction if using native token
+     * @dev Reverts if item is not for sale, listing has expired, or payment fails
+     * @dev Automatically handles EIP-2981 royalties and protocol fees
+     */
+    function buyItem(address nftContract, uint256 tokenId) external payable nonReentrant {
+        Listing memory listing = s_listings[nftContract][tokenId];
+
+        // Validate listing is active and not expired
+        if (!listing.active) revert NFTMarketplace__ItemNotForSale();
+        if (listing.expiry != 0 && block.timestamp >= listing.expiry) revert NFTMarketplace__ListingExpired();
+
+        _executeSale(nftContract, tokenId, listing, msg.sender, listing.price);
+    }
+
+    /**
+     * @notice Execute the sale transaction for an NFT
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token being sold
+     * @param listing The listing details containing seller, price, and payment info
+     * @param buyer The address of the purchaser
+     * @param price The agreed sale price
+     * @dev Marks listing as inactive, distributes funds, and transfers NFT ownership
+     * @dev Emits ItemSold event upon successful completion
+     */
+    function _executeSale(address nftContract, uint256 tokenId, Listing memory listing, address buyer, uint256 price)
+        internal
+    {
+        // Mark listing as inactive to prevent double purchases
+        s_listings[nftContract][tokenId].active = false;
+
+        // Distribute funds according to protocol fees and royalties
+        _distributeFunds(nftContract, tokenId, listing.seller, buyer, listing.paymentToken, price);
+
+        // Transfer NFT ownership from marketplace to buyer
+        IERC721(nftContract).transferFrom(address(this), buyer, tokenId);
+
+        emit ItemSold(buyer, listing.seller, nftContract, tokenId, listing.paymentToken, price, s_protocolFee);
+    }
+
+    /**
+     * @notice Distribute sale proceeds among seller, royalty recipient, and protocol treasury
+     * @param nftContract The address of the NFT contract for royalty lookup
+     * @param tokenId The ID of the NFT token for royalty calculation
+     * @param seller The address of the NFT seller
+     * @param // buyer The address of the NFT buyer (unused but maintained for interface)
+     * @param paymentToken The token used for payment (address(0) for native ETH)
+     * @param price The total sale price before fees and royalties
+     * @dev Calculates protocol fee first, then EIP-2981 royalties, remainder goes to seller
+     * @dev Handles both native ETH and ERC20 token transfers
+     * @dev Reverts if royalty amount exceeds available funds after protocol fee
+     */
+    function _distributeFunds(
+        address nftContract,
+        uint256 tokenId,
+        address seller,
+        address, /* buyer */
+        address paymentToken,
+        uint256 price
+    ) internal {
+        // Calculate protocol fee (marketplace commission)
+        uint256 protocolFeeAmount = (price * s_protocolFee) / BASIS_POINTS;
+        uint256 remainingAmount = price - protocolFeeAmount;
+
+        // Handle EIP-2981 royalty payments if supported by NFT contract
+        (address royaltyRecipient, uint256 royaltyAmount) = _getRoyaltyInfo(nftContract, tokenId, price);
+        if (royaltyAmount > 0 && royaltyRecipient != address(0)) {
+            // Ensure royalty doesn't exceed available funds
+            if (royaltyAmount > remainingAmount) revert NFTMarketplace__RoyaltyExceedPrice();
+
+            remainingAmount -= royaltyAmount;
+
+            // Transfer royalty to creator
+            if (paymentToken == NATIVE_TOKEN) {
+                _transferNative(royaltyRecipient, royaltyAmount);
+            } else {
+                IERC20(paymentToken).transfer(royaltyRecipient, royaltyAmount);
+            }
+        }
+
+        // Transfer protocol fee
+        if (protocolFeeAmount > 0) {
+            if (paymentToken == NATIVE_TOKEN) {
+                _transferNative(s_treasury, protocolFeeAmount);
+            } else {
+                IERC20(paymentToken).transfer(s_treasury, protocolFeeAmount);
+            }
+        }
+
+        // Transfer remaining to seller
+        if (remainingAmount > 0) {
+            if (paymentToken == NATIVE_TOKEN) {
+                _transferNative(seller, remainingAmount);
+            } else {
+                IERC20(paymentToken).transfer(seller, remainingAmount);
+            }
+        }
+    }
+
+    /**
+     * @notice Retrieve royalty information using EIP-2981 standard
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token
+     * @param salePrice The sale price to calculate royalties from
+     * @return recipient The address to receive royalties (address(0) if not supported)
+     * @return amount The royalty amount calculated (0 if not supported)
+     * @dev Uses try-catch to safely handle NFTs that don't implement EIP-2981
+     */
+    function _getRoyaltyInfo(address nftContract, uint256 tokenId, uint256 salePrice)
+        internal
+        view
+        returns (address, uint256)
+    {
+        try IERC2981(nftContract).royaltyInfo(tokenId, salePrice) returns (address recipient, uint256 amount) {
+            return (recipient, amount);
+        } catch {
+            return (address(0), 0);
+        }
+    }
+
+    /**
+     * @notice Safely transfer native ETH to a recipient
+     * @param to The address to receive the native tokens
+     * @param amount The amount of native tokens to transfer
+     * @dev Uses low-level call with gas stipend for reliable transfers
+     * @dev Reverts if the transfer fails
+     */
+    function _transferNative(address to, uint256 amount) internal {
+        (bool success,) = to.call{value: amount}("");
+        if (!success) revert NFTMarketplace__TransferFailed();
     }
 
     // ================= GETTERS ======================
