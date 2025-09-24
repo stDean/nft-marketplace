@@ -68,12 +68,26 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     /// @notice Mapping to track bids for gas optimization: NFT contract => token ID => bidder => bid amount
     mapping(address => mapping(uint256 => mapping(address => uint256))) public s_bids;
 
+    // ================= EVENTS ======================
+    event PaymentTokenAdded(address indexed token);
+    event PaymentTokenRemoved(address indexed token);
+    event ProtocolFeeUpdated(uint256 newFee);
+    event TreasuryUpdated(address newTreasury);
+
     // ================= ERRORS ======================
     /// @notice Thrown when protocol fee exceeds maximum allowed (10%)
     error NFTMarketplace__FeeTooHigh();
 
     /// @notice Thrown when treasury address is zero address
     error NFTMarketplace__InvalidTreasury();
+
+    /// @notice Thrown when add a native token again
+    error NFTMarketplace__NativeTokenAlreadySupported();
+
+    /// @notice Thrown when token already supported
+    error NFTMarketplace__TokenAlreadySupported();
+
+    error NFTMarketplace__NativeTokenCannotBeRemoved();
 
     // ================= FUNCTIONS ======================
     /**
@@ -93,20 +107,42 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         s_supportedTokens.add(NATIVE_TOKEN);
     }
 
+    function addPaymentToken(address _token) external onlyOwner {
+        if (_token == NATIVE_TOKEN) revert NFTMarketplace__NativeTokenAlreadySupported();
+        if (!s_supportedTokens.add(_token)) revert NFTMarketplace__TokenAlreadySupported();
+
+        s_supportedTokens.add(_token);
+        emit PaymentTokenAdded(_token);
+    }
+
+    function removePaymentToken(address _token) external onlyOwner {
+        if (_token == NATIVE_TOKEN) revert NFTMarketplace__NativeTokenCannotBeRemoved();
+        if (!s_supportedTokens.remove(_token)) revert NFTMarketplace__TokenAlreadySupported();
+
+        s_supportedTokens.remove(_token);
+        emit PaymentTokenRemoved(_token);
+    }
+
+    function updateProtocolFee(uint256 _newFee) external onlyOwner {
+        if (_newFee > 1000) revert NFTMarketplace__FeeTooHigh();
+
+        s_protocolFee = _newFee;
+        emit ProtocolFeeUpdated(_newFee);
+    }
+
+    function updateTreasury(address _newTreasury) external onlyOwner {
+        if (_newTreasury == address(0)) revert NFTMarketplace__InvalidTreasury();
+
+        s_treasury = _newTreasury;
+        emit TreasuryUpdated(_newTreasury);
+    }
+
     // ================= GETTERS ======================
     /**
-     * @notice Get all supported payment tokens
-     * @return addresses Array of all supported token addresses (including native token)
-     * @dev Native token is represented as address(0)
+     * @notice Get supported payment tokens
+     * @return Array of supported token addresses
      */
     function getSupportedTokens() external view returns (address[] memory) {
-        uint256 length = s_supportedTokens.length();
-        address[] memory tokens = new address[](length);
-
-        for (uint256 i = 0; i < length; i++) {
-            tokens[i] = s_supportedTokens.at(i);
-        }
-
-        return tokens;
+        return s_supportedTokens.values();
     }
 }

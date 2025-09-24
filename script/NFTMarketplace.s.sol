@@ -16,6 +16,8 @@ contract DeployNFTMarketplace is Script {
 
         vm.stopBroadcast();
 
+        console.log("NFTMarketplace contract deployed at: ", address(nftMarketplace));
+
         return (nftMarketplace, helperConfig);
     }
 }
