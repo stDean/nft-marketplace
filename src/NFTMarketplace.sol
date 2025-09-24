@@ -73,21 +73,25 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     event PaymentTokenRemoved(address indexed token);
     event ProtocolFeeUpdated(uint256 newFee);
     event TreasuryUpdated(address newTreasury);
+    event ItemListed(
+        address indexed seller,
+        address indexed nftContract,
+        uint256 indexed tokenId,
+        address paymentToken,
+        uint256 price,
+        uint256 expiry
+    );
 
     // ================= ERRORS ======================
-    /// @notice Thrown when protocol fee exceeds maximum allowed (10%)
     error NFTMarketplace__FeeTooHigh();
-
-    /// @notice Thrown when treasury address is zero address
     error NFTMarketplace__InvalidTreasury();
-
-    /// @notice Thrown when add a native token again
     error NFTMarketplace__NativeTokenAlreadySupported();
-
-    /// @notice Thrown when token already supported
     error NFTMarketplace__TokenAlreadySupported();
-
     error NFTMarketplace__NativeTokenCannotBeRemoved();
+    error NFTMarketplace__PriceMustBeGreaterThanZero();
+    error NFTMarketplace__UnsupportedPaymentToken();
+    error NFTMarketplace__InvalidExpiry();
+    error NFTMarketplace__NotListingOwner();
 
     // ================= FUNCTIONS ======================
     /**
@@ -107,22 +111,35 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         s_supportedTokens.add(NATIVE_TOKEN);
     }
 
+    /**
+     * @notice Add a new payment token to the supported tokens list
+     * @param _token The address of the ERC20 token to add
+     * @dev Only callable by the owner. Cannot add native token or already supported tokens
+     */
     function addPaymentToken(address _token) external onlyOwner {
         if (_token == NATIVE_TOKEN) revert NFTMarketplace__NativeTokenAlreadySupported();
         if (!s_supportedTokens.add(_token)) revert NFTMarketplace__TokenAlreadySupported();
 
-        s_supportedTokens.add(_token);
         emit PaymentTokenAdded(_token);
     }
 
+    /**
+     * @notice Remove a payment token from the supported tokens list
+     * @param _token The address of the ERC20 token to remove
+     * @dev Only callable by the owner. Cannot remove native token
+     */
     function removePaymentToken(address _token) external onlyOwner {
         if (_token == NATIVE_TOKEN) revert NFTMarketplace__NativeTokenCannotBeRemoved();
         if (!s_supportedTokens.remove(_token)) revert NFTMarketplace__TokenAlreadySupported();
 
-        s_supportedTokens.remove(_token);
         emit PaymentTokenRemoved(_token);
     }
 
+    /**
+     * @notice Update the protocol fee percentage
+     * @param _newFee The new fee percentage in basis points (100 = 1%)
+     * @dev Only callable by the owner. Fee cannot exceed 10% (1000 basis points)
+     */
     function updateProtocolFee(uint256 _newFee) external onlyOwner {
         if (_newFee > 1000) revert NFTMarketplace__FeeTooHigh();
 
@@ -130,11 +147,57 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         emit ProtocolFeeUpdated(_newFee);
     }
 
+    /**
+     * @notice Update the treasury address where protocol fees are sent
+     * @param _newTreasury The new treasury address
+     * @dev Only callable by the owner. Treasury cannot be zero address
+     */
     function updateTreasury(address _newTreasury) external onlyOwner {
         if (_newTreasury == address(0)) revert NFTMarketplace__InvalidTreasury();
 
         s_treasury = _newTreasury;
         emit TreasuryUpdated(_newTreasury);
+    }
+
+    /**
+     * @notice List an NFT for sale at a fixed price or update an existing listing
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token to list
+     * @param paymentToken The token address for payment (address(0) for native ETH)
+     * @param price The sale price in the specified payment token
+     * @param expiry Timestamp when listing expires (0 for no expiry)
+     * @dev For new listings: Transfers NFT to marketplace for escrow. Requires prior approval.
+     * @dev For existing listings: Updates price and expiry without transferring NFT again.
+     * @dev Only the original seller can update an existing listing.
+     * @dev Only active listings can be purchased. Expired listings become inactive.
+     * @dev Reverts if price is zero, payment token is unsupported, or expiry is invalid.
+     */
+    function listItem(address nftContract, uint256 tokenId, address paymentToken, uint256 price, uint256 expiry)
+        external
+        nonReentrant
+    {
+        if (price == 0) revert NFTMarketplace__PriceMustBeGreaterThanZero();
+        if (!s_supportedTokens.contains(paymentToken)) revert NFTMarketplace__UnsupportedPaymentToken();
+        if (expiry != 0 && expiry <= block.timestamp) revert NFTMarketplace__InvalidExpiry();
+
+        // Check if marketplace already owns the NFT (updating existing listing)
+        address currentOwner = IERC721(nftContract).ownerOf(tokenId);
+
+        if (currentOwner != address(this)) {
+            // Marketplace doesn't own it yet - transfer from seller (new listing)
+            IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
+        } else {
+            // Marketplace already owns it - verify seller is updating their own listing
+            Listing memory existingListing = s_listings[nftContract][tokenId];
+            if (existingListing.seller != msg.sender) {
+                revert NFTMarketplace__NotListingOwner();
+            }
+            // If it's the same seller, no transfer needed (listing update)
+        }
+
+        s_listings[nftContract][tokenId] =
+            Listing({seller: msg.sender, paymentToken: paymentToken, price: price, expiry: expiry, active: true});
+        emit ItemListed(msg.sender, nftContract, tokenId, paymentToken, price, expiry);
     }
 
     // ================= GETTERS ======================
