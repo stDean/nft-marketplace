@@ -4,20 +4,26 @@ pragma solidity ^0.8;
 import {Test, console} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {DeployNFTMarketplace, HelperConfig, NFTMarketplace} from "script/NFTMarketplace.s.sol";
-import {MockERC721} from "test/mocks/MockERC721.sol";
+import {MockERC721WithRoyalty} from "test/mocks/MockERC721WithRoyalty.sol";
+import {MockERC20} from "test/mocks/MockERC20.sol";
 
 contract NFTMarketplaceTest is Test {
     DeployNFTMarketplace deployer;
     HelperConfig helperConfig;
     NFTMarketplace nftMarketplace;
     HelperConfig.NetworkConfig config;
-    MockERC721 mockNFT;
+    MockERC20 mockERC20;
+    MockERC721WithRoyalty mockNFT; // Updated type
 
     address user = makeAddr("user");
+    address buyer = makeAddr("buyer");
+    address creator = makeAddr("creator");
     address token1 = makeAddr("token1");
     address token2 = makeAddr("token2");
     uint256 tokenId = 1;
+    address treasury;
     address nativeToken;
+    uint256 protocolFee;
 
     uint256 constant LISTING_PRICE = 1 ether;
     uint256 immutable expiry = block.timestamp + 7 days;
@@ -27,28 +33,36 @@ contract NFTMarketplaceTest is Test {
         (nftMarketplace, helperConfig) = deployer.run();
         config = helperConfig.getConfig();
         nativeToken = nftMarketplace.NATIVE_TOKEN();
+        treasury = config.treasury;
+        protocolFee = config.protocolFee;
 
-        mockNFT = new MockERC721();
+        // mockNFT = new MockERC721();
+        mockNFT = new MockERC721WithRoyalty(creator, 500); // 5% royalty
         mockNFT.mint(user, tokenId);
         vm.prank(user);
         mockNFT.approve(address(nftMarketplace), tokenId);
+
+        // Deploy mock ERC20 for testing
+        mockERC20 = new MockERC20();
+        vm.prank(nftMarketplace.owner());
+        nftMarketplace.addPaymentToken(address(mockERC20));
     }
 
     // ========================== CONSTRUCTOR/INITIALIZATION TEST =============================
     function test_ConstructorRevertIFProtocolFeeTooHigh() public {
         vm.expectRevert(NFTMarketplace.NFTMarketplace__FeeTooHigh.selector);
-        new NFTMarketplace(5_000, config.treasury);
+        new NFTMarketplace(5_000, treasury);
     }
 
     function test_ConstructorRevertIFTreasuryIsZeroAddress() public {
         vm.expectRevert(NFTMarketplace.NFTMarketplace__InvalidTreasury.selector);
-        new NFTMarketplace(config.protocolFee, address(0));
+        new NFTMarketplace(protocolFee, address(0));
     }
 
     function test_ConstructorShouldInitializeCorrectly() public view {
-        assertEq(nftMarketplace.s_treasury(), config.treasury);
-        assertEq(nftMarketplace.s_protocolFee(), config.protocolFee);
-        assertEq(nftMarketplace.getSupportedTokens().length, 1);
+        assertEq(nftMarketplace.s_treasury(), treasury);
+        assertEq(nftMarketplace.s_protocolFee(), protocolFee);
+        assertEq(nftMarketplace.getSupportedTokens().length, 2);
         assertEq(nftMarketplace.getSupportedTokens()[0], nativeToken);
     }
 
@@ -58,9 +72,9 @@ contract NFTMarketplaceTest is Test {
         nftMarketplace.addPaymentToken(token1);
 
         address[] memory tokens = nftMarketplace.getSupportedTokens();
-        assertEq(tokens.length, 2);
+        assertEq(tokens.length, 3);
         assertEq(tokens[0], nativeToken);
-        assertEq(tokens[1], token1);
+        assertEq(tokens[2], token1);
     }
 
     function test_AddPaymentTokenRevertWhenNotOwner() public {
@@ -97,14 +111,14 @@ contract NFTMarketplaceTest is Test {
         nftMarketplace.addPaymentToken(token2);
 
         address[] memory tokensBefore = nftMarketplace.getSupportedTokens();
-        assertEq(tokensBefore.length, 3);
+        assertEq(tokensBefore.length, 4);
 
         nftMarketplace.removePaymentToken(token1);
 
         address[] memory tokensAfter = nftMarketplace.getSupportedTokens();
-        assertEq(tokensAfter.length, 2);
+        assertEq(tokensAfter.length, 3);
         assertEq(tokensAfter[0], nativeToken);
-        assertEq(tokensAfter[1], token2);
+        assertEq(tokensAfter[2], token2);
         vm.stopPrank();
     }
 
@@ -231,7 +245,7 @@ contract NFTMarketplaceTest is Test {
 
     function test_ListItemRevertsWhenNotNFTOwner() public {
         // User doesn't own the token they're trying to list
-        MockERC721 anotherNFT = new MockERC721();
+        MockERC721WithRoyalty anotherNFT = new MockERC721WithRoyalty(creator, 500);
         anotherNFT.mint(makeAddr("otherUser"), tokenId); // Mint to different user
 
         vm.prank(user); // But user tries to list it
@@ -241,7 +255,7 @@ contract NFTMarketplaceTest is Test {
 
     function test_ListItemRevertsWhenNotApproved() public {
         // User owns but didn't approve marketplace
-        MockERC721 anotherNFT = new MockERC721();
+        MockERC721WithRoyalty anotherNFT = new MockERC721WithRoyalty(creator, 500);
         anotherNFT.mint(user, tokenId);
 
         vm.prank(user);
@@ -292,5 +306,106 @@ contract NFTMarketplaceTest is Test {
 
         // NFT should still be with marketplace
         assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
+    }
+
+    // ========================== BUY ITEM TESTS =============================
+    function test_BuyItemWithNativeToken() public {
+        // List NFT for sale
+        vm.prank(user);
+        nftMarketplace.listItem(address(mockNFT), tokenId, nativeToken, LISTING_PRICE, expiry);
+
+        // Buy NFT with native token
+        vm.deal(buyer, LISTING_PRICE);
+        uint256 buyerBalanceBefore = buyer.balance;
+        uint256 sellerBalanceBefore = user.balance;
+        uint256 treasuryBalanceBefore = treasury.balance;
+        uint256 creatorBalanceBefore = creator.balance; // Track creator balance for royalty
+
+        vm.prank(buyer);
+        nftMarketplace.buyItem{value: LISTING_PRICE}(address(mockNFT), tokenId);
+
+        // Verify NFT transferred to buyer
+        assertEq(mockNFT.ownerOf(tokenId), buyer);
+
+        // Verify listing is inactive
+        (,,,, bool active) = nftMarketplace.s_listings(address(mockNFT), tokenId);
+        assertFalse(active);
+
+        // Verify fund distribution with royalty (protocol fee = 2.5%, royalty = 5%)
+        uint256 _protocolFee = (LISTING_PRICE * protocolFee) / 10000; // 2.5%
+        uint256 royaltyAmount = (LISTING_PRICE * 500) / 10000; // 5% royalty
+        uint256 sellerProceeds = LISTING_PRICE - _protocolFee - royaltyAmount;
+
+        assertEq(user.balance, sellerBalanceBefore + sellerProceeds);
+        assertEq(treasury.balance, treasuryBalanceBefore + _protocolFee);
+        assertEq(creator.balance, creatorBalanceBefore + royaltyAmount); // Creator receives royalty
+        assertEq(buyer.balance, buyerBalanceBefore - LISTING_PRICE);
+    }
+
+    function test_BuyItemWithERC20Token() public {
+        // Mint ERC20 tokens to buyer and approve marketplace
+        mockERC20.mint(buyer, LISTING_PRICE);
+        vm.prank(buyer);
+        mockERC20.approve(address(nftMarketplace), LISTING_PRICE);
+
+        // List NFT for sale with ERC20
+        vm.prank(user);
+        nftMarketplace.listItem(address(mockNFT), tokenId, address(mockERC20), LISTING_PRICE, expiry);
+
+        uint256 sellerBalanceBefore = mockERC20.balanceOf(user);
+        uint256 treasuryBalanceBefore = mockERC20.balanceOf(nftMarketplace.s_treasury());
+        uint256 creatorBalanceBefore = mockERC20.balanceOf(creator); // Track creator balance
+
+        vm.prank(buyer);
+        nftMarketplace.buyItem(address(mockNFT), tokenId);
+
+        // Verify NFT transferred to buyer
+        assertEq(mockNFT.ownerOf(tokenId), buyer);
+
+        // Verify fund distribution with royalty
+        uint256 _protocolFee = (LISTING_PRICE * protocolFee) / 10000; // 2.5%
+        uint256 royaltyAmount = (LISTING_PRICE * 500) / 10000; // 5% royalty
+        uint256 sellerProceeds = LISTING_PRICE - _protocolFee - royaltyAmount;
+
+        assertEq(mockERC20.balanceOf(user), sellerBalanceBefore + sellerProceeds);
+        assertEq(mockERC20.balanceOf(nftMarketplace.s_treasury()), treasuryBalanceBefore + _protocolFee);
+        assertEq(mockERC20.balanceOf(creator), creatorBalanceBefore + royaltyAmount); // Creator receives royalty
+        assertEq(mockERC20.balanceOf(buyer), 0);
+    }
+
+    function test_RoyaltyInfoIsCorrect() public view {
+        uint256 salePrice = 1 ether;
+        (address receiver, uint256 royaltyAmount) = mockNFT.royaltyInfo(tokenId, salePrice);
+
+        assertEq(receiver, creator);
+        assertEq(royaltyAmount, (salePrice * 500) / 10000); // 5% of 1 ether
+    }
+
+    // Test that the marketplace handles NFTs without royalty correctly
+    function test_BuyItemWithNonRoyaltyNFT() public {
+        // Create a simple NFT without royalty support
+        MockERC721WithRoyalty simpleNFT = new MockERC721WithRoyalty(address(0), 0); // No royalty
+        simpleNFT.mint(user, 2); // Mint tokenId 2
+        vm.prank(user);
+        simpleNFT.approve(address(nftMarketplace), 2);
+
+        // List the non-royalty NFT
+        vm.prank(user);
+        nftMarketplace.listItem(address(simpleNFT), 2, nativeToken, LISTING_PRICE, expiry);
+
+        vm.deal(buyer, LISTING_PRICE);
+        uint256 sellerBalanceBefore = user.balance;
+        uint256 treasuryBalanceBefore = treasury.balance;
+
+        vm.prank(buyer);
+        nftMarketplace.buyItem{value: LISTING_PRICE}(address(simpleNFT), 2);
+
+        // Verify distribution without royalty
+        uint256 _protocolFee = (LISTING_PRICE * protocolFee) / 10000;
+        uint256 sellerProceeds = LISTING_PRICE - _protocolFee;
+
+        assertEq(user.balance, sellerBalanceBefore + sellerProceeds);
+        assertEq(treasury.balance, treasuryBalanceBefore + _protocolFee);
+        assertEq(simpleNFT.ownerOf(2), buyer);
     }
 }

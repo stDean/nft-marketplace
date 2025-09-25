@@ -105,6 +105,7 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__ListingExpired();
     error NFTMarketplace__RoyaltyExceedPrice();
     error NFTMarketplace__TransferFailed();
+    error NFTMarketplace__InsufficientPayment();
 
     // ================= FUNCTIONS ======================
     // Required to receive native tokens
@@ -116,7 +117,6 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
      * @param _treasury The address that receives protocol fees
      * @dev Sets up initial configuration and adds native ETH as supported payment token
      */
-
     constructor(uint256 _protocolFee, address _treasury) Ownable(msg.sender) {
         if (_protocolFee > 1000) revert NFTMarketplace__FeeTooHigh(); // Max 10% fee
         if (_treasury == address(0)) revert NFTMarketplace__InvalidTreasury();
@@ -221,9 +221,15 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
      * @notice Purchase an NFT listed for sale
      * @param nftContract The address of the NFT contract
      * @param tokenId The ID of the NFT token to purchase
-     * @dev Payment must be sent with the transaction if using native token
-     * @dev Reverts if item is not for sale, listing has expired, or payment fails
+     * @dev For native token payments: Payment must be sent with the transaction (msg.value must equal or exceed listing price)
+     * @dev For ERC20 token payments: Buyer must have approved the marketplace to spend the required amount
+     * @dev Reverts if:
+     *      - Item is not for sale (NFTMarketplace__ItemNotForSale)
+     *      - Listing has expired (NFTMarketplace__ListingExpired)
+     *      - Insufficient native token payment (NFTMarketplace__InsufficientPayment)
+     *      - ERC20 transfer fails (transferFrom reverts)
      * @dev Automatically handles EIP-2981 royalties and protocol fees
+     * @dev Transfers NFT ownership to buyer and distributes funds to seller, royalty recipient, and protocol treasury
      */
     function buyItem(address nftContract, uint256 tokenId) external payable nonReentrant {
         Listing memory listing = s_listings[nftContract][tokenId];
@@ -231,6 +237,15 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         // Validate listing is active and not expired
         if (!listing.active) revert NFTMarketplace__ItemNotForSale();
         if (listing.expiry != 0 && block.timestamp >= listing.expiry) revert NFTMarketplace__ListingExpired();
+
+        // Handle payment based on token type
+        if (listing.paymentToken == NATIVE_TOKEN) {
+            // Native token payment
+            if (msg.value < listing.price) revert NFTMarketplace__InsufficientPayment();
+        } else {
+            // ERC20 token payment - transfer tokens from buyer to marketplace
+            IERC20(listing.paymentToken).transferFrom(msg.sender, address(this), listing.price);
+        }
 
         _executeSale(nftContract, tokenId, listing, msg.sender, listing.price);
     }
