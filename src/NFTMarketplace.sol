@@ -90,6 +90,16 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         uint256 price,
         uint256 protocolFee
     );
+    event AuctionCreated(
+        address indexed seller,
+        address indexed nftContract,
+        uint256 indexed tokenId,
+        address paymentToken,
+        uint256 startPrice,
+        uint256 reservePrice,
+        uint256 startTime,
+        uint256 endTime
+    );
 
     // ================= ERRORS ======================
     error NFTMarketplace__FeeTooHigh();
@@ -106,6 +116,8 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__RoyaltyExceedPrice();
     error NFTMarketplace__TransferFailed();
     error NFTMarketplace__InsufficientPayment();
+    error NFTMarketplace__InvalidDuration();
+    error NFTMarketplace__StartPriceMustBeGreaterThanZero();
 
     // ================= FUNCTIONS ======================
     // Required to receive native tokens
@@ -248,6 +260,70 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         }
 
         _executeSale(nftContract, tokenId, listing, msg.sender, listing.price);
+    }
+
+    /**
+     * @notice Create a new auction for an NFT
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token to auction
+     * @param paymentToken The ERC20 token address to be used for bids
+     * @param startPrice The minimum starting bid price (must be > 0)
+     * @param reservePrice The hidden minimum price to win the auction (0 = no reserve)
+     * @param duration The auction duration in seconds (within min/max bounds)
+     * @dev Transfers the NFT from seller to marketplace contract
+     * @dev Reverts if:
+     *      - Payment token is not supported (NFTMarketplace__UnsupportedPaymentToken)
+     *      - Duration is invalid (NFTMarketplace__InvalidDuration)
+     *      - Start price is zero (NFTMarketplace__StartPriceMustBeGreaterThanZero)
+     *      - NFT transfer fails (ERC721 transferFrom reverts)
+     * @dev Auction starts immediately and ends at block.timestamp + duration
+     */
+    function createAuction(
+        address nftContract,
+        uint256 tokenId,
+        address paymentToken,
+        uint256 startPrice,
+        uint256 reservePrice,
+        uint256 duration
+    ) external nonReentrant {
+        if (!s_supportedTokens.contains(paymentToken)) revert NFTMarketplace__UnsupportedPaymentToken();
+        if (duration < MIN_AUCTION_DURATION || duration > MAX_AUCTION_DURATION) {
+            revert NFTMarketplace__InvalidDuration();
+        }
+        if (startPrice == 0) revert NFTMarketplace__StartPriceMustBeGreaterThanZero();
+
+        uint256 startTime = block.timestamp;
+        uint256 endTime = startTime + duration;
+
+        // Check if marketplace already owns the NFT (converting from listing to auction)
+        address currentOwner = IERC721(nftContract).ownerOf(tokenId);
+        if (currentOwner != address(this)) {
+            // Marketplace doesn't own it yet - transfer from seller
+            IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
+        } else {
+            // Marketplace already owns it - verify seller is updating their own listing
+            Listing memory existingListing = s_listings[nftContract][tokenId];
+            if (existingListing.seller != msg.sender) {
+                revert NFTMarketplace__NotListingOwner();
+            }
+            // Deactivate the existing listing when converting to auction
+            s_listings[nftContract][tokenId].active = false;
+        }
+
+        s_auctions[nftContract][tokenId] = Auction({
+            seller: msg.sender,
+            paymentToken: paymentToken,
+            startPrice: startPrice,
+            reservePrice: reservePrice,
+            startTime: startTime,
+            endTime: endTime,
+            highestBidder: address(0),
+            highestBid: 0,
+            settled: false
+        });
+        emit AuctionCreated(
+            msg.sender, nftContract, tokenId, paymentToken, startPrice, reservePrice, startTime, endTime
+        );
     }
 
     /**

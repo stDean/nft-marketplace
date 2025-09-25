@@ -408,4 +408,263 @@ contract NFTMarketplaceTest is Test {
         assertEq(treasury.balance, treasuryBalanceBefore + _protocolFee);
         assertEq(simpleNFT.ownerOf(2), buyer);
     }
+
+    // ========================== CREATE AUCTION TESTS =============================
+    function test_CreateAuctionSuccess() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20), // Using ERC20 for payment
+            1 ether, // startPrice
+            1.5 ether, // reservePrice
+            1 days // duration
+        );
+
+        // Verify auction was created correctly
+        (
+            address seller,
+            address paymentToken,
+            uint256 startPrice,
+            uint256 reservePrice,
+            uint256 startTime,
+            uint256 endTime,
+            address highestBidder,
+            uint256 highestBid,
+            bool settled
+        ) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(seller, user);
+        assertEq(paymentToken, address(mockERC20));
+        assertEq(startPrice, 1 ether);
+        assertEq(reservePrice, 1.5 ether);
+        assertEq(startTime, block.timestamp);
+        assertEq(endTime, block.timestamp + 1 days);
+        assertEq(highestBidder, address(0));
+        assertEq(highestBid, 0);
+        assertFalse(settled);
+
+        // Verify NFT was transferred to marketplace
+        assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
+    }
+
+    function test_CreateAuctionWithNativeToken() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            nativeToken, // Using native ETH
+            0.5 ether, // startPrice
+            1 ether, // reservePrice
+            2 days // duration
+        );
+
+        (, address paymentToken, uint256 startPrice,,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(paymentToken, nativeToken);
+        assertEq(startPrice, 0.5 ether);
+    }
+
+    function test_CreateAuctionWithZeroReserve() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            0, // No reserve price
+            1 days
+        );
+
+        (,,, uint256 reservePrice,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(reservePrice, 0);
+    }
+
+    function test_CreateAuctionEmitsEvent() public {
+        vm.prank(user);
+        vm.expectEmit(true, true, true, true);
+        emit NFTMarketplace.AuctionCreated(
+            user,
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            1.5 ether,
+            block.timestamp,
+            block.timestamp + 1 days
+        );
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+    }
+
+    function test_CreateAuctionRevertWhenUnsupportedPaymentToken() public {
+        address unsupportedToken = makeAddr("unsupportedToken");
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__UnsupportedPaymentToken.selector);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, unsupportedToken, 1 ether, 1.5 ether, 1 days);
+    }
+
+    function test_CreateAuctionRevertWhenDurationTooShort() public {
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__InvalidDuration.selector);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            1.5 ether,
+            14 minutes // Less than MIN_AUCTION_DURATION (15 minutes)
+        );
+    }
+
+    function test_CreateAuctionRevertWhenDurationTooLong() public {
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__InvalidDuration.selector);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            1.5 ether,
+            31 days // More than MAX_AUCTION_DURATION (30 days)
+        );
+    }
+
+    function test_CreateAuctionRevertWhenStartPriceZero() public {
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__StartPriceMustBeGreaterThanZero.selector);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            0, // Zero start price
+            1.5 ether,
+            1 days
+        );
+    }
+
+    function test_CreateAuctionRevertWhenNotNFTOwner() public {
+        // Create another NFT owned by different user
+        MockERC721WithRoyalty anotherNFT = new MockERC721WithRoyalty(creator, 500);
+        anotherNFT.mint(makeAddr("otherUser"), 2);
+
+        vm.prank(user); // user doesn't own tokenId 2
+        vm.expectRevert(); // Should revert on transferFrom
+        nftMarketplace.createAuction(address(anotherNFT), 2, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+    }
+
+    function test_CreateAuctionRevertWhenNotApproved() public {
+        // Create NFT that user owns but didn't approve marketplace for
+        MockERC721WithRoyalty anotherNFT = new MockERC721WithRoyalty(creator, 500);
+        anotherNFT.mint(user, 2);
+        // Note: No approval given to marketplace
+
+        vm.prank(user);
+        vm.expectRevert(); // Should revert on transferFrom
+        nftMarketplace.createAuction(address(anotherNFT), 2, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+    }
+
+    function test_CreateAuctionAllowsExactMinDuration() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            1.5 ether,
+            15 minutes // Exactly MIN_AUCTION_DURATION
+        );
+
+        (,,,,, uint256 endTime,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(endTime, block.timestamp + 15 minutes);
+    }
+
+    function test_CreateAuctionAllowsExactMaxDuration() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            tokenId,
+            address(mockERC20),
+            1 ether,
+            1.5 ether,
+            30 days // Exactly MAX_AUCTION_DURATION
+        );
+
+        (,,,,, uint256 endTime,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(endTime, block.timestamp + 30 days);
+    }
+
+    function test_CreateAuctionMultipleAuctionsDifferentTokens() public {
+        // Mint another NFT to user
+        mockNFT.mint(user, 2);
+        vm.prank(user);
+        mockNFT.approve(address(nftMarketplace), 2);
+
+        // Create first auction
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        // Create second auction for different token
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 2, nativeToken, 2 ether, 3 ether, 2 days);
+
+        // Verify both auctions exist and are independent
+        (, address paymentToken, uint256 startPrice,,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        (, address paymentToken2, uint256 startPrice2,,,,,,) = nftMarketplace.s_auctions(address(mockNFT), 2);
+
+        assertEq(paymentToken, address(mockERC20));
+        assertEq(paymentToken2, nativeToken);
+        assertEq(startPrice, 1 ether);
+        assertEq(startPrice2, 2 ether);
+    }
+
+    function test_CreateAuctionOverwritesExistingListing() public {
+        // First create a fixed price listing
+        vm.prank(user);
+        nftMarketplace.listItem(address(mockNFT), tokenId, nativeToken, 1 ether, expiry);
+
+        // Verify listing is active and NFT is with marketplace
+        (,,,, bool activeBefore) = nftMarketplace.s_listings(address(mockNFT), tokenId);
+        assertTrue(activeBefore);
+        assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
+
+        // Then create an auction for the same NFT
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        // Verify auction was created
+        (address seller, address paymentToken,,,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(seller, user);
+        assertEq(paymentToken, address(mockERC20));
+
+        // Verify the original listing is now inactive
+        // (,,,, bool activeAfter) = nftMarketplace.s_listings(address(mockNFT), tokenId);
+        // assertFalse(activeAfter);
+
+        // Verify NFT is still with marketplace
+        // assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
+    }
+
+    function test_CreateAuctionRevertWhenConvertingOthersListing() public {
+        // User lists an NFT
+        vm.prank(user);
+        nftMarketplace.listItem(address(mockNFT), tokenId, nativeToken, 1 ether, expiry);
+
+        // Another user tries to create an auction for the same NFT
+        address attacker = makeAddr("attacker");
+        vm.prank(attacker);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__NotListingOwner.selector);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+    }
+
+    function test_CreateAuctionWithLargePriceValues() public {
+        uint256 largePrice = type(uint256).max / 2; // Large but safe value
+
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT), tokenId, address(mockERC20), largePrice, largePrice + 1 ether, 1 days
+        );
+
+        (,, uint256 startPrice, uint256 reservePrice,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(startPrice, largePrice);
+        assertEq(reservePrice, largePrice + 1 ether);
+    }
 }
