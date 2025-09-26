@@ -408,6 +408,17 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         );
     }
 
+    /**
+     * @notice Bulk list multiple NFTs for sale in a single transaction
+     * @dev Gas-optimized function to list multiple items. All arrays must be the same length.
+     * @param nftContracts Array of NFT contract addresses to list
+     * @param tokenIds Array of token IDs corresponding to each NFT
+     * @param paymentTokens Array of payment token addresses (address(0) for native token)
+     * @param prices Array of listing prices for each NFT
+     * @param expiries Array of expiry timestamps (0 for no expiry)
+     * @custom:reverts NFTMarketplace__ArrayLengthMismatch if array lengths don't match
+     * @custom:reverts NFTMarketplace__TooManyItems if attempting to list more than 50 items
+     */
     function bulkListItems(
         address[] calldata nftContracts,
         uint256[] calldata tokenIds,

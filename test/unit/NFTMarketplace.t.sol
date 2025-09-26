@@ -950,4 +950,228 @@ contract NFTMarketplaceTest is Test {
         (,,,,,,,, bool settled) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
         assertTrue(settled);
     }
+
+    // ========================== BULK LIST ITEMS TESTS =============================
+    function test_BulkListItemsSuccess() public {
+        // Mint multiple NFTs to user (starting from tokenId 2 since 1 is already minted in setup)
+        uint256[] memory tokenIds = new uint256[](3);
+
+        // Fix: Use i=0,1,2 as array indices, and tokenIds 2,3,4 as actual token IDs
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 _tokenId = i + 2; // This gives us tokenIds 2, 3, 4
+            tokenIds[i] = _tokenId; // Correct array indexing: tokenIds[0]=2, tokenIds[1]=3, tokenIds[2]=4
+            mockNFT.mint(user, _tokenId);
+        }
+
+        vm.prank(user);
+        mockNFT.setApprovalForAll(address(nftMarketplace), true);
+
+        // Prepare bulk listing data
+        address[] memory nftContracts = new address[](3);
+        address[] memory paymentTokens = new address[](3);
+        uint256[] memory prices = new uint256[](3);
+        uint256[] memory expiries = new uint256[](3);
+
+        for (uint256 i = 0; i < 3; i++) {
+            nftContracts[i] = address(mockNFT);
+            paymentTokens[i] = nativeToken;
+            prices[i] = LISTING_PRICE + i * 0.1 ether;
+            expiries[i] = expiry + i * 1 days;
+        }
+
+        vm.prank(user);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+
+        // Verify all listings were created correctly
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 _tokenId = tokenIds[i]; // Get the actual tokenId from our array
+
+            (address seller, address paymentToken, uint256 price, uint256 _expiry, bool active) =
+                nftMarketplace.s_listings(address(mockNFT), _tokenId);
+
+            assertEq(seller, user);
+            assertEq(paymentToken, nativeToken);
+            assertEq(price, prices[i]);
+            assertEq(_expiry, expiries[i]);
+            assertTrue(active);
+            assertEq(mockNFT.ownerOf(_tokenId), address(nftMarketplace));
+        }
+    }
+
+    function test_BulkListItemsRevertWhenArrayLengthMismatch() public {
+        address[] memory nftContracts = new address[](2);
+        uint256[] memory tokenIds = new uint256[](3); // Different length
+        address[] memory paymentTokens = new address[](2);
+        uint256[] memory prices = new uint256[](2);
+        uint256[] memory expiries = new uint256[](2);
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__ArrayLengthMismatch.selector);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+    }
+
+    function test_BulkListItemsRevertWhenTooManyItems() public {
+        uint256 itemCount = 53; // Exceeds 50 limit
+        address[] memory nftContracts = new address[](itemCount);
+        uint256[] memory tokenIds = new uint256[](itemCount);
+        address[] memory paymentTokens = new address[](itemCount);
+        uint256[] memory prices = new uint256[](itemCount);
+        uint256[] memory expiries = new uint256[](itemCount);
+
+        // Mint and approve all NFTs
+        for (uint256 i = 2; i < itemCount; i++) {
+            mockNFT.mint(user, i);
+        }
+        vm.prank(user);
+        mockNFT.setApprovalForAll(address(nftMarketplace), true);
+
+        // Fill arrays
+        for (uint256 i = 0; i < itemCount; i++) {
+            nftContracts[i] = address(mockNFT);
+            tokenIds[i] = i;
+            paymentTokens[i] = nativeToken;
+            prices[i] = LISTING_PRICE;
+            expiries[i] = expiry;
+        }
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__TooManyItems.selector);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+    }
+
+    function test_BulkListItemsWithMixedPaymentTokens() public {
+        // Setup ERC20 token support
+        address erc20Token = makeAddr("erc20Token");
+        vm.prank(nftMarketplace.owner());
+        nftMarketplace.addPaymentToken(erc20Token);
+
+        // Mint 2nd NFTs
+        mockNFT.mint(user, 2);
+        vm.prank(user);
+        mockNFT.setApprovalForAll(address(nftMarketplace), true);
+
+        address[] memory nftContracts = new address[](2);
+        uint256[] memory tokenIds = new uint256[](2);
+        address[] memory paymentTokens = new address[](2);
+        uint256[] memory prices = new uint256[](2);
+        uint256[] memory expiries = new uint256[](2);
+
+        // First item with native token
+        nftContracts[0] = address(mockNFT);
+        tokenIds[0] = 1;
+        paymentTokens[0] = nativeToken;
+        prices[0] = LISTING_PRICE;
+        expiries[0] = expiry;
+
+        // Second item with ERC20 token
+        nftContracts[1] = address(mockNFT);
+        tokenIds[1] = 2;
+        paymentTokens[1] = erc20Token;
+        prices[1] = LISTING_PRICE * 2;
+        expiries[1] = expiry + 1 days;
+
+        vm.prank(user);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+
+        // Verify mixed payment tokens are handled correctly
+        (, address paymentToken1,,,) = nftMarketplace.s_listings(address(mockNFT), 1);
+        (, address paymentToken2,,,) = nftMarketplace.s_listings(address(mockNFT), 2);
+
+        assertEq(paymentToken1, nativeToken);
+        assertEq(paymentToken2, erc20Token);
+    }
+
+    function test_BulkListItemsGasOptimization() public {
+        // Mint 10 NFTs
+        uint256 itemCount = 10;
+        for (uint256 i = 2; i <= itemCount; i++) {
+            mockNFT.mint(user, i);
+        }
+        vm.prank(user);
+        mockNFT.setApprovalForAll(address(nftMarketplace), true);
+
+        // Prepare arrays
+        address[] memory nftContracts = new address[](itemCount);
+        uint256[] memory tokenIds = new uint256[](itemCount);
+        address[] memory paymentTokens = new address[](itemCount);
+        uint256[] memory prices = new uint256[](itemCount);
+        uint256[] memory expiries = new uint256[](itemCount);
+
+        for (uint256 i = 0; i < itemCount; i++) {
+            nftContracts[i] = address(mockNFT);
+            tokenIds[i] = i + 1;
+            paymentTokens[i] = nativeToken;
+            prices[i] = LISTING_PRICE;
+            expiries[i] = expiry;
+        }
+
+        // Test gas usage for bulk operation
+        vm.prank(user);
+        uint256 gasStart = gasleft();
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+        uint256 gasUsed = gasStart - gasleft();
+
+        console.log("Gas used for bulk listing 10 items:", gasUsed);
+
+        // Verify all items were listed
+        for (uint256 i = 1; i <= itemCount; i++) {
+            (,,,, bool active) = nftMarketplace.s_listings(address(mockNFT), i);
+            assertTrue(active);
+        }
+    }
+
+    function test_BulkListItemsRevertForSingleInvalidItem() public {
+        // Mint 3 NFTs
+        for (uint256 i = 2; i <= 3; i++) {
+            mockNFT.mint(user, i);
+        }
+        vm.prank(user);
+        mockNFT.setApprovalForAll(address(nftMarketplace), true);
+
+        address[] memory nftContracts = new address[](3);
+        uint256[] memory tokenIds = new uint256[](3);
+        address[] memory paymentTokens = new address[](3);
+        uint256[] memory prices = new uint256[](3);
+        uint256[] memory expiries = new uint256[](3);
+
+        // Two valid items
+        for (uint256 i = 0; i < 2; i++) {
+            nftContracts[i] = address(mockNFT);
+            tokenIds[i] = i + 1;
+            paymentTokens[i] = nativeToken;
+            prices[i] = LISTING_PRICE;
+            expiries[i] = expiry;
+        }
+
+        // One invalid item (unsupported payment token)
+        nftContracts[2] = address(mockNFT);
+        tokenIds[2] = 3;
+        paymentTokens[2] = makeAddr("unsupportedToken"); // This will cause revert
+        prices[2] = LISTING_PRICE;
+        expiries[2] = expiry;
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__UnsupportedPaymentToken.selector);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+
+        // Verify no items were listed (entire transaction reverts)
+        for (uint256 i = 1; i <= 3; i++) {
+            (,,,, bool active) = nftMarketplace.s_listings(address(mockNFT), i);
+            assertFalse(active); // All should be inactive due to revert
+        }
+    }
+
+    function test_BulkListItemsWithZeroItems() public {
+        address[] memory nftContracts = new address[](0);
+        uint256[] memory tokenIds = new uint256[](0);
+        address[] memory paymentTokens = new address[](0);
+        uint256[] memory prices = new uint256[](0);
+        uint256[] memory expiries = new uint256[](0);
+
+        vm.prank(user);
+        nftMarketplace.bulkListItems(nftContracts, tokenIds, paymentTokens, prices, expiries);
+
+        // Should not revert and execute successfully with zero items
+        assertTrue(true); // Just confirm no revert
+    }
 }
