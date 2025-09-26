@@ -636,11 +636,11 @@ contract NFTMarketplaceTest is Test {
         assertEq(paymentToken, address(mockERC20));
 
         // Verify the original listing is now inactive
-        // (,,,, bool activeAfter) = nftMarketplace.s_listings(address(mockNFT), tokenId);
-        // assertFalse(activeAfter);
+        (,,,, bool activeAfter) = nftMarketplace.s_listings(address(mockNFT), tokenId);
+        assertFalse(activeAfter);
 
         // Verify NFT is still with marketplace
-        // assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
+        assertEq(mockNFT.ownerOf(tokenId), address(nftMarketplace));
     }
 
     function test_CreateAuctionRevertWhenConvertingOthersListing() public {
@@ -666,5 +666,163 @@ contract NFTMarketplaceTest is Test {
         (,, uint256 startPrice, uint256 reservePrice,,,,,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
         assertEq(startPrice, largePrice);
         assertEq(reservePrice, largePrice + 1 ether);
+    }
+
+    // ========================== PLACE BID TESTS =============================
+    function test_PlaceBidFirstBidWithNativeToken() public {
+        // Create auction with native token
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Place first bid
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+
+        (,,,,,, address highestBidder, uint256 highestBid,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(highestBidder, buyer);
+        assertEq(highestBid, 1.1 ether);
+    }
+
+    function test_PlaceBidFirstBidWithERC20() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        // Mint and approve tokens
+        mockERC20.mint(buyer, 1.1 ether);
+        vm.prank(buyer);
+        mockERC20.approve(address(nftMarketplace), 1.1 ether);
+
+        vm.prank(buyer);
+        nftMarketplace.placeBid(address(mockNFT), tokenId, 1.1 ether);
+
+        (,,,,,, address highestBidder, uint256 highestBid,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(highestBidder, buyer);
+        assertEq(highestBid, 1.1 ether);
+    }
+
+    function test_PlaceBidOutbidPreviousBidderWithNative() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // First bid
+        address bidder1 = makeAddr("bidder1");
+        vm.deal(bidder1, 1.1 ether);
+        vm.prank(bidder1);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+
+        // Second bid (5% higher)
+        uint256 secondBid = 1.1 ether + (1.1 ether * 5 / 100); // 1.155 ether
+        vm.deal(buyer, secondBid);
+        uint256 bidder1BalanceBefore = bidder1.balance;
+
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: secondBid}(address(mockNFT), tokenId, secondBid);
+
+        (,,,,,, address highestBidder, uint256 highestBid,) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertEq(highestBidder, buyer);
+        assertEq(highestBid, secondBid);
+        assertEq(bidder1.balance, bidder1BalanceBefore + 1.1 ether); // Refunded
+    }
+
+    function test_PlaceBidRevertWhenAuctionNotStarted() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Try to bid before auction starts (impossible since it starts immediately)
+        // But test with time travel to future auction
+        vm.warp(block.timestamp - 1); // Go back in time
+
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionNotActive.selector);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+    }
+
+    function test_PlaceBidRevertWhenAuctionEnded() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Fast forward past auction end
+        vm.warp(block.timestamp + 2 days);
+
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionNotActive.selector);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+    }
+
+    function test_PlaceBidRevertWhenBidBelowStartPrice() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 0.9 ether);
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__BidTooLow.selector);
+        nftMarketplace.placeBid{value: 0.9 ether}(address(mockNFT), tokenId, 0.9 ether);
+    }
+
+    function test_PlaceBidRevertWhenBidBelow5PercentIncrement() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // First bid
+        address bidder1 = makeAddr("bidder1");
+        vm.deal(bidder1, 1.1 ether);
+        vm.prank(bidder1);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+
+        // Second bid with insufficient increment (less than 5%)
+        vm.deal(buyer, 1.14 ether); // 1.14 < 1.155 (5% of 1.1)
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__BidTooLow.selector);
+        nftMarketplace.placeBid{value: 1.14 ether}(address(mockNFT), tokenId, 1.14 ether);
+    }
+
+    function test_PlaceBidRevertWhenIncorrectETHAmount() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 1.2 ether);
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__IncorrectETHamount.selector);
+        nftMarketplace.placeBid{value: 1.2 ether}(address(mockNFT), tokenId, 1.1 ether); // Different amounts
+    }
+
+    function test_PlaceBidRevertWhenETHForERC20Auction() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        mockERC20.mint(buyer, 1.1 ether);
+        vm.prank(buyer);
+        mockERC20.approve(address(nftMarketplace), 1.1 ether);
+
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__ETHNotRequired.selector);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+    }
+
+    function test_PlaceBidEmitsBidPlacedEvent() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        vm.expectEmit(true, true, true, true);
+        emit NFTMarketplace.BidPlaced(buyer, address(mockNFT), tokenId, 1.1 ether, nativeToken);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+    }
+
+    function test_PlaceBidStoresBidInMapping() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+
+        uint256 storedBid = nftMarketplace.s_bids(address(mockNFT), tokenId, buyer);
+        assertEq(storedBid, 1.1 ether);
     }
 }

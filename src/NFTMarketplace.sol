@@ -100,6 +100,13 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         uint256 startTime,
         uint256 endTime
     );
+    event BidPlaced(
+        address indexed bidder,
+        address indexed nftContract,
+        uint256 indexed tokenId,
+        uint256 amount,
+        address paymentToken
+    );
 
     // ================= ERRORS ======================
     error NFTMarketplace__FeeTooHigh();
@@ -118,6 +125,11 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__InsufficientPayment();
     error NFTMarketplace__InvalidDuration();
     error NFTMarketplace__StartPriceMustBeGreaterThanZero();
+    error NFTMarketplace__AuctionNotActive();
+    error NFTMarketplace__AuctionSettled();
+    error NFTMarketplace__BidTooLow();
+    error NFTMarketplace__IncorrectETHamount();
+    error NFTMarketplace__ETHNotRequired();
 
     // ================= FUNCTIONS ======================
     // Required to receive native tokens
@@ -324,6 +336,62 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         emit AuctionCreated(
             msg.sender, nftContract, tokenId, paymentToken, startPrice, reservePrice, startTime, endTime
         );
+    }
+
+    /**
+     * @notice Place a bid on an active auction
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token being auctioned
+     * @param bidAmount The amount of the bid (in payment token units)
+     * @dev For native token auctions: bidAmount must equal msg.value
+     * @dev For ERC20 token auctions: bidAmount will be transferred from bidder, msg.value must be 0
+     * @dev Reverts if:
+     *      - Auction is not active (NFTMarketplace__AuctionNotActive)
+     *      - Auction is already settled (NFTMarketplace__AuctionSettled)
+     *      - Bid amount is below minimum required (5% above current bid or start price) (NFTMarketplace__BidTooLow)
+     *      - Incorrect ETH amount sent for native token auctions (NFTMarketplace__IncorrectETHamount)
+     *      - ETH sent for ERC20 token auctions (NFTMarketplace__ETHNotRequired)
+     * @dev Automatically refunds previous highest bidder when outbid
+     * @dev Stores bid for gas optimization in bulk operations
+     */
+    function placeBid(address nftContract, uint256 tokenId, uint256 bidAmount) external payable nonReentrant {
+        Auction storage auction = s_auctions[nftContract][tokenId];
+
+        if (block.timestamp < auction.startTime || block.timestamp > auction.endTime) {
+            revert NFTMarketplace__AuctionNotActive();
+        }
+        if (auction.settled) revert NFTMarketplace__AuctionSettled();
+
+        address paymentToken = auction.paymentToken;
+        uint256 currentBid = auction.highestBid;
+        uint256 minBid = currentBid == 0 ? auction.startPrice : currentBid + (currentBid * 5 / 100); // 5% min increment
+
+        if (bidAmount < minBid) revert NFTMarketplace__BidTooLow();
+
+        // Handle payment based on token type
+        if (paymentToken == NATIVE_TOKEN) {
+            if (msg.value != bidAmount) revert NFTMarketplace__IncorrectETHamount();
+            // Refund previous bidder if any
+            if (auction.highestBidder != address(0)) {
+                _transferNative(auction.highestBidder, currentBid);
+            }
+        } else {
+            if (msg.value != 0) revert NFTMarketplace__ETHNotRequired();
+            IERC20(paymentToken).transferFrom(msg.sender, address(this), bidAmount);
+            // Refund previous bidder
+            if (auction.highestBidder != address(0)) {
+                IERC20(paymentToken).transfer(auction.highestBidder, currentBid);
+            }
+        }
+
+        // Update auction state
+        auction.highestBidder = msg.sender;
+        auction.highestBid = bidAmount;
+
+        // Store bid for gas optimization in bulk operations
+        s_bids[nftContract][tokenId][msg.sender] = bidAmount;
+
+        emit BidPlaced(msg.sender, nftContract, tokenId, bidAmount, paymentToken);
     }
 
     /**
