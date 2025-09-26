@@ -825,4 +825,129 @@ contract NFTMarketplaceTest is Test {
         uint256 storedBid = nftMarketplace.s_bids(address(mockNFT), tokenId, buyer);
         assertEq(storedBid, 1.1 ether);
     }
+
+    // ========================== SETTLE AUCTION TESTS =============================
+    function test_SettleAuctionSuccess() public {
+        // Create and complete auction
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Place winning bid above reserve
+        vm.deal(buyer, 2 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 2 ether}(address(mockNFT), tokenId, 2 ether);
+
+        // Fast forward to end of auction
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+
+        // Verify auction settled and NFT transferred
+        (,,,,,,,, bool settled) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertTrue(settled);
+        assertEq(mockNFT.ownerOf(tokenId), buyer);
+    }
+
+    function test_SettleAuctionRevertWhenAuctionNotEnded() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionNotEnded.selector);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+    }
+
+    function test_SettleAuctionRevertWhenAlreadySettled() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 2 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 2 ether}(address(mockNFT), tokenId, 2 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        // Settle first time
+        vm.prank(user);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+
+        // Try to settle again
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionSettled.selector);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+    }
+
+    function test_SettleAuctionRevertWhenReserveNotMet() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Bid below reserve
+        vm.deal(buyer, 1.4 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.4 ether}(address(mockNFT), tokenId, 1.4 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__ReserveNotMet.selector);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+    }
+
+    function test_SettleAuctionEmitsEvent() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.deal(buyer, 2 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 2 ether}(address(mockNFT), tokenId, 2 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        vm.expectEmit(true, true, true, true);
+        emit NFTMarketplace.AuctionSettled(buyer, user, address(mockNFT), tokenId, 2 ether, nativeToken);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+    }
+
+    function test_SettleAuctionWithERC20Payment() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        // Bid with ERC20
+        mockERC20.mint(buyer, 2 ether);
+        vm.prank(buyer);
+        mockERC20.approve(address(nftMarketplace), 2 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid(address(mockNFT), tokenId, 2 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId);
+
+        // Verify settlement
+        (,,,,,,,, bool settled) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertTrue(settled);
+        assertEq(mockNFT.ownerOf(tokenId), buyer);
+    }
+
+    function test_SettleAuctionWithZeroReserve() public {
+        // Auction with no reserve (reservePrice = 0)
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), tokenId, nativeToken, 1 ether, 0, 1 days);
+
+        // Even small bid should work
+        vm.deal(buyer, 1.1 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.1 ether}(address(mockNFT), tokenId, 1.1 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        nftMarketplace.settleAuction(address(mockNFT), tokenId); // Should not revert
+
+        (,,,,,,,, bool settled) = nftMarketplace.s_auctions(address(mockNFT), tokenId);
+        assertTrue(settled);
+    }
 }

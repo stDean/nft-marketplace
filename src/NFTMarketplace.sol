@@ -107,6 +107,14 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         uint256 amount,
         address paymentToken
     );
+    event AuctionSettled(
+        address indexed winner,
+        address indexed seller,
+        address indexed nftContract,
+        uint256 tokenId,
+        uint256 finalPrice,
+        address paymentToken
+    );
 
     // ================= ERRORS ======================
     error NFTMarketplace__FeeTooHigh();
@@ -130,6 +138,10 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__BidTooLow();
     error NFTMarketplace__IncorrectETHamount();
     error NFTMarketplace__ETHNotRequired();
+    error NFTMarketplace__AuctionNotEnded();
+    error NFTMarketplace__ReserveNotMet();
+    error NFTMarketplace__ArrayLengthMismatch();
+    error NFTMarketplace__TooManyItems();
 
     // ================= FUNCTIONS ======================
     // Required to receive native tokens
@@ -207,38 +219,12 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
      * @param paymentToken The token address for payment (address(0) for native ETH)
      * @param price The sale price in the specified payment token
      * @param expiry Timestamp when listing expires (0 for no expiry)
-     * @dev For new listings: Transfers NFT to marketplace for escrow. Requires prior approval.
-     * @dev For existing listings: Updates price and expiry without transferring NFT again.
-     * @dev Only the original seller can update an existing listing.
-     * @dev Only active listings can be purchased. Expired listings become inactive.
-     * @dev Reverts if price is zero, payment token is unsupported, or expiry is invalid.
      */
     function listItem(address nftContract, uint256 tokenId, address paymentToken, uint256 price, uint256 expiry)
         external
         nonReentrant
     {
-        if (price == 0) revert NFTMarketplace__PriceMustBeGreaterThanZero();
-        if (!s_supportedTokens.contains(paymentToken)) revert NFTMarketplace__UnsupportedPaymentToken();
-        if (expiry != 0 && expiry <= block.timestamp) revert NFTMarketplace__InvalidExpiry();
-
-        // Check if marketplace already owns the NFT (updating existing listing)
-        address currentOwner = IERC721(nftContract).ownerOf(tokenId);
-
-        if (currentOwner != address(this)) {
-            // Marketplace doesn't own it yet - transfer from seller (new listing)
-            IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
-        } else {
-            // Marketplace already owns it - verify seller is updating their own listing
-            Listing memory existingListing = s_listings[nftContract][tokenId];
-            if (existingListing.seller != msg.sender) {
-                revert NFTMarketplace__NotListingOwner();
-            }
-            // If it's the same seller, no transfer needed (listing update)
-        }
-
-        s_listings[nftContract][tokenId] =
-            Listing({seller: msg.sender, paymentToken: paymentToken, price: price, expiry: expiry, active: true});
-        emit ItemListed(msg.sender, nftContract, tokenId, paymentToken, price, expiry);
+        _listItem(nftContract, tokenId, paymentToken, price, expiry);
     }
 
     /**
@@ -392,6 +378,92 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         s_bids[nftContract][tokenId][msg.sender] = bidAmount;
 
         emit BidPlaced(msg.sender, nftContract, tokenId, bidAmount, paymentToken);
+    }
+
+    /**
+     * @notice Settle a completed auction and transfer NFT to winner
+     * @param nftContract Address of the NFT contract
+     * @param tokenId ID of the auctioned token
+     * @dev Reverts if auction not ended, already settled, or reserve not met
+     * @dev Distributes funds to seller, royalties, and protocol fees
+     * @dev Transfers NFT to highest bidder and marks auction as settled
+     */
+    function settleAuction(address nftContract, uint256 tokenId) external nonReentrant {
+        Auction storage auction = s_auctions[nftContract][tokenId];
+        if (block.timestamp < auction.endTime) revert NFTMarketplace__AuctionNotEnded();
+        if (auction.settled) revert NFTMarketplace__AuctionSettled();
+        if (auction.highestBid < auction.reservePrice) revert NFTMarketplace__ReserveNotMet();
+
+        auction.settled = true;
+
+        // Distribute funds with royalties
+        uint256 finalPrice = auction.highestBid;
+        _distributeFunds(nftContract, tokenId, auction.seller, auction.highestBidder, auction.paymentToken, finalPrice);
+
+        // Transfer NFT to winner
+        IERC721(nftContract).transferFrom(address(this), auction.highestBidder, tokenId);
+
+        emit AuctionSettled(
+            auction.highestBidder, auction.seller, nftContract, tokenId, finalPrice, auction.paymentToken
+        );
+    }
+
+    function bulkListItems(
+        address[] calldata nftContracts,
+        uint256[] calldata tokenIds,
+        address[] calldata paymentTokens,
+        uint256[] calldata prices,
+        uint256[] calldata expiries
+    ) external nonReentrant {
+        if (nftContracts.length != tokenIds.length) revert NFTMarketplace__ArrayLengthMismatch();
+        if (nftContracts.length != paymentTokens.length) revert NFTMarketplace__ArrayLengthMismatch();
+        if (nftContracts.length != prices.length) revert NFTMarketplace__ArrayLengthMismatch();
+        if (nftContracts.length != expiries.length) revert NFTMarketplace__ArrayLengthMismatch();
+        if (nftContracts.length > 50) revert NFTMarketplace__TooManyItems();
+
+        for (uint256 i = 0; i < nftContracts.length; i++) {
+            _listItem(nftContracts[i], tokenIds[i], paymentTokens[i], prices[i], expiries[i]);
+        }
+    }
+
+    /**
+     * @notice List an NFT for sale at a fixed price or update an existing listing
+     * @param nftContract The address of the NFT contract
+     * @param tokenId The ID of the NFT token to list
+     * @param paymentToken The token address for payment (address(0) for native ETH)
+     * @param price The sale price in the specified payment token
+     * @param expiry Timestamp when listing expires (0 for no expiry)
+     * @dev For new listings: Transfers NFT to marketplace for escrow. Requires prior approval.
+     * @dev For existing listings: Updates price and expiry without transferring NFT again.
+     * @dev Only the original seller can update an existing listing.
+     * @dev Only active listings can be purchased. Expired listings become inactive.
+     * @dev Reverts if price is zero, payment token is unsupported, or expiry is invalid.
+     */
+    function _listItem(address nftContract, uint256 tokenId, address paymentToken, uint256 price, uint256 expiry)
+        internal
+    {
+        if (price == 0) revert NFTMarketplace__PriceMustBeGreaterThanZero();
+        if (!s_supportedTokens.contains(paymentToken)) revert NFTMarketplace__UnsupportedPaymentToken();
+        if (expiry != 0 && expiry <= block.timestamp) revert NFTMarketplace__InvalidExpiry();
+
+        // Check if marketplace already owns the NFT (updating existing listing)
+        address currentOwner = IERC721(nftContract).ownerOf(tokenId);
+
+        if (currentOwner != address(this)) {
+            // Marketplace doesn't own it yet - transfer from seller (new listing)
+            IERC721(nftContract).transferFrom(msg.sender, address(this), tokenId);
+        } else {
+            // Marketplace already owns it - verify seller is updating their own listing
+            Listing memory existingListing = s_listings[nftContract][tokenId];
+            if (existingListing.seller != msg.sender) {
+                revert NFTMarketplace__NotListingOwner();
+            }
+            // If it's the same seller, no transfer needed (listing update)
+        }
+
+        s_listings[nftContract][tokenId] =
+            Listing({seller: msg.sender, paymentToken: paymentToken, price: price, expiry: expiry, active: true});
+        emit ItemListed(msg.sender, nftContract, tokenId, paymentToken, price, expiry);
     }
 
     /**
