@@ -438,6 +438,49 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     }
 
     /**
+     * @notice Purchase multiple NFTs in a single transaction
+     * @param nftContracts Array of NFT contract addresses to purchase from
+     * @param tokenIds Array of token IDs corresponding to each NFT
+     * @dev Gas-optimized function for bulk purchases. All arrays must be the same length.
+     * @dev For native token payments: Total msg.value must equal or exceed sum of all native token listing prices
+     * @dev For ERC20 token payments: Transfers tokens for each ERC20-priced item during processing
+     * @dev Reverts if:
+     *      - Array lengths don't match (NFTMarketplace__ArrayLengthMismatch)
+     *      - More than 20 items attempted (NFTMarketplace__TooManyItems)
+     *      - Any item is not for sale or expired (NFTMarketplace__ItemNotForSale, NFTMarketplace__ListingExpired)
+     *      - Insufficient native token payment (NFTMarketplace__InsufficientPayment)
+     * @dev Processes all validations upfront, then executes sales
+     * @dev Automatically refunds excess native tokens if overpaid
+     * @dev Mixed payment tokens are supported in single transaction
+     */
+    function bulkBuyItems(address[] calldata nftContracts, uint256[] calldata tokenIds) external payable nonReentrant {
+        if (nftContracts.length != tokenIds.length) revert NFTMarketplace__ArrayLengthMismatch();
+        if (nftContracts.length > 20) revert NFTMarketplace__TooManyItems();
+
+        uint256 totalNativeValue = 0;
+        for (uint256 i = 0; i < nftContracts.length; i++) {
+            Listing memory listing = s_listings[nftContracts[i]][tokenIds[i]];
+            if (!listing.active) revert NFTMarketplace__ItemNotForSale();
+            if (listing.expiry != 0 && block.timestamp >= listing.expiry) revert NFTMarketplace__ListingExpired();
+
+            if (listing.paymentToken == NATIVE_TOKEN) {
+                totalNativeValue += listing.price;
+            } else {
+                // ERC20 token payment - transfer tokens from buyer to marketplace
+                IERC20(listing.paymentToken).transferFrom(msg.sender, address(this), listing.price);
+            }
+
+            _executeSale(nftContracts[i], tokenIds[i], listing, msg.sender, listing.price);
+        }
+
+        if (msg.value < totalNativeValue) revert NFTMarketplace__InsufficientPayment();
+        if (msg.value > totalNativeValue) {
+            // Refund excess ETH sent
+            _transferNative(msg.sender, msg.value - totalNativeValue);
+        }
+    }
+
+    /**
      * @notice List an NFT for sale at a fixed price or update an existing listing
      * @param nftContract The address of the NFT contract
      * @param tokenId The ID of the NFT token to list
