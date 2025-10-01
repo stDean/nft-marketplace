@@ -950,6 +950,181 @@ contract NFTMarketplaceTest is Test {
         assertTrue(settled);
     }
 
+    // ========================== WITHDRAW UNSUCCESSFUL AUCTION TESTS =============================
+    function test_WithdrawUnsuccessfulAuctionSuccess() public {
+        // Create auction with reserve price
+        vm.prank(user);
+        nftMarketplace.createAuction(
+            address(mockNFT),
+            1,
+            nativeToken,
+            1 ether, // startPrice
+            1.5 ether, // reservePrice
+            1 days // duration
+        );
+
+        // Place bid below reserve
+        vm.deal(buyer, 1.4 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.4 ether}(address(mockNFT), 1, 1.4 ether);
+
+        // Let auction end
+        vm.warp(block.timestamp + 2 days);
+
+        // Verify NFT is with marketplace
+        assertEq(mockNFT.ownerOf(1), address(nftMarketplace));
+
+        // Withdraw unsuccessful auction
+        vm.prank(user);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+
+        // Verify NFT returned to seller
+        assertEq(mockNFT.ownerOf(1), user);
+
+        // Verify auction marked as settled
+        (,,,,,,,, bool settled) = nftMarketplace.s_auctions(address(mockNFT), 1);
+        assertTrue(settled);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionEmitsEvent() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        vm.expectEmit(true, true, true, true);
+        emit NFTMarketplace.AuctionWithdrawn(user, address(mockNFT), 1);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionRevertWhenNotAuctionOwner() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        vm.warp(block.timestamp + 2 days);
+
+        // Try to withdraw as non-owner
+        vm.prank(buyer);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__NotAuctionOwner.selector);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionRevertWhenAuctionNotEnded() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Try to withdraw before auction ends
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionNotEnded.selector);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionRevertWhenAlreadySettled() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Place winning bid
+        vm.deal(buyer, 2 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 2 ether}(address(mockNFT), 1, 2 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        // Settle auction first
+        vm.prank(user);
+        nftMarketplace.settleAuction(address(mockNFT), 1);
+
+        // Try to withdraw after settlement
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__AuctionSettled.selector);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionRevertWhenReserveMet() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Place bid meeting reserve
+        vm.deal(buyer, 1.5 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid{value: 1.5 ether}(address(mockNFT), 1, 1.5 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        // Try to withdraw when reserve is met
+        vm.prank(user);
+        vm.expectRevert(NFTMarketplace.NFTMarketplace__ReserveMet.selector);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionWithNoBids() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // No bids placed
+        vm.warp(block.timestamp + 2 days);
+
+        // Withdraw should succeed with no bids
+        vm.prank(user);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+
+        assertEq(mockNFT.ownerOf(1), user);
+    }
+
+    function test_WithdrawUnsuccessfulAuctionWithERC20Auction() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, address(mockERC20), 1 ether, 1.5 ether, 1 days);
+
+        // Place bid below reserve with ERC20
+        mockERC20.mint(buyer, 1.4 ether);
+        vm.prank(buyer);
+        mockERC20.approve(address(nftMarketplace), 1.4 ether);
+        vm.prank(buyer);
+        nftMarketplace.placeBid(address(mockNFT), 1, 1.4 ether);
+
+        vm.warp(block.timestamp + 2 days);
+
+        // Withdraw should work for ERC20 auctions too
+        vm.prank(user);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+
+        assertEq(mockNFT.ownerOf(1), user);
+
+        // Bidder should be refunded their ERC20 tokens
+        assertEq(mockERC20.balanceOf(buyer), 1.4 ether); // Tokens were refunded during withdrawal
+    }
+
+    function test_WithdrawUnsuccessfulAuctionRefundsPreviousBidder() public {
+        vm.prank(user);
+        nftMarketplace.createAuction(address(mockNFT), 1, nativeToken, 1 ether, 1.5 ether, 1 days);
+
+        // Place multiple bids below reserve
+        address bidder1 = makeAddr("bidder1");
+        address bidder2 = makeAddr("bidder2");
+
+        vm.deal(bidder1, 1.2 ether);
+        vm.prank(bidder1);
+        nftMarketplace.placeBid{value: 1.2 ether}(address(mockNFT), 1, 1.2 ether);
+
+        vm.deal(bidder2, 1.3 ether);
+        vm.prank(bidder2);
+        nftMarketplace.placeBid{value: 1.3 ether}(address(mockNFT), 1, 1.3 ether);
+
+        // Capture balances AFTER all bids are placed
+        uint256 bidder1BalanceAfterBidding = bidder1.balance; // Should be 0 (was refunded when outbid)
+        uint256 bidder2BalanceAfterBidding = bidder2.balance; // Should be 0 (all ETH used for bid)
+
+        vm.warp(block.timestamp + 2 days);
+
+        vm.prank(user);
+        nftMarketplace.withdrawUnsuccessfulAuction(address(mockNFT), 1);
+
+        // With the fixed function, bidder2 should be refunded
+        assertEq(bidder1.balance, bidder1BalanceAfterBidding); // Was already refunded when outbid
+        assertEq(bidder2.balance, bidder2BalanceAfterBidding + 1.3 ether); // Current highest bidder refunded
+    }
+
     // ========================== BULK LIST ITEMS TESTS =============================
     function test_BulkListItemsSuccess() public {
         // Mint multiple NFTs to user (starting from tokenId 2 since 1 is already minted in setup)
@@ -1200,7 +1375,6 @@ contract NFTMarketplaceTest is Test {
         // Buy all items in bulk
         vm.deal(buyer, totalPrice);
         uint256 buyerBalanceBefore = buyer.balance;
-        uint256 sellerBalanceBefore = user.balance;
 
         vm.prank(buyer);
         nftMarketplace.bulkBuyItems{value: totalPrice}(nftContracts, tokenIds);

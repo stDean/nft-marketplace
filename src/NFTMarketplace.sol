@@ -115,6 +115,7 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         uint256 finalPrice,
         address paymentToken
     );
+    event AuctionWithdrawn(address indexed seller, address indexed nftContract, uint256 indexed tokenId);
 
     // ================= ERRORS ======================
     error NFTMarketplace__FeeTooHigh();
@@ -142,6 +143,8 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
     error NFTMarketplace__ReserveNotMet();
     error NFTMarketplace__ArrayLengthMismatch();
     error NFTMarketplace__TooManyItems();
+    error NFTMarketplace__NotAuctionOwner();
+    error NFTMarketplace__ReserveMet();
 
     // ================= FUNCTIONS ======================
     // Required to receive native tokens
@@ -406,6 +409,29 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         emit AuctionSettled(
             auction.highestBidder, auction.seller, nftContract, tokenId, finalPrice, auction.paymentToken
         );
+    }
+
+    function withdrawUnsuccessfulAuction(address nftContract, uint256 tokenId) external nonReentrant {
+        Auction storage auction = s_auctions[nftContract][tokenId];
+
+        if (auction.seller != msg.sender) revert NFTMarketplace__NotAuctionOwner();
+        if (block.timestamp < auction.endTime) revert NFTMarketplace__AuctionNotEnded();
+        if (auction.settled) revert NFTMarketplace__AuctionSettled();
+        if (auction.highestBid >= auction.reservePrice) revert NFTMarketplace__ReserveMet();
+
+        // Refund the highest bidder if there is one
+        if (auction.highestBidder != address(0) && auction.highestBid > 0) {
+            if (auction.paymentToken == NATIVE_TOKEN) {
+                _transferNative(auction.highestBidder, auction.highestBid);
+            } else {
+                IERC20(auction.paymentToken).transfer(auction.highestBidder, auction.highestBid);
+            }
+        }
+
+        auction.settled = true;
+        IERC721(nftContract).transferFrom(address(this), msg.sender, tokenId);
+
+        emit AuctionWithdrawn(msg.sender, nftContract, tokenId);
     }
 
     /**
