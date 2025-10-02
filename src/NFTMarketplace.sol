@@ -411,6 +411,17 @@ contract NFTMarketplace is ReentrancyGuard, Ownable {
         );
     }
 
+    /**
+     * @notice Withdraw NFT from unsuccessful auction (reserve not met)
+     * @dev Refunds highest bidder and returns NFT to seller. Only callable by auction creator after auction ends.
+     * @param nftContract NFT contract address
+     * @param tokenId NFT token ID
+     * @custom:reverts NFTMarketplace__NotAuctionOwner If caller is not auction seller
+     * @custom:reverts NFTMarketplace__AuctionNotEnded If auction hasn't ended
+     * @custom:reverts NFTMarketplace__AuctionSettled If auction already settled
+     * @custom:reverts NFTMarketplace__ReserveMet If reserve price was met
+     * @dev Emits AuctionWithdrawn event and refunds highest bidder automatically
+     */
     function withdrawUnsuccessfulAuction(address nftContract, uint256 tokenId) external nonReentrant {
         Auction storage auction = s_auctions[nftContract][tokenId];
 
